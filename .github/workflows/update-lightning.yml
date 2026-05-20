@@ -1,0 +1,59 @@
+name: Update Lightning Data (GOES-R GLM)
+
+# Cron: every 5 minutes — GHA's documented minimum schedule interval
+# (anything tighter is silently downgraded; we've hit that in practice
+# on firestorm-aircraft-data).
+#
+# 5-min cadence vs GLM's 20-second native rate is a deliberate tradeoff:
+# GHA cron is the only free always-on poll runner we have, and 5 min is
+# its floor. The 15-minute window in fetch_glm.py covers any GHA cron
+# slippage (1–5 min lag during high-load periods) and gives the frontend
+# a stable "last 15 minutes of strikes" view rather than a punctuated
+# 5-min slice.
+#
+# End-to-end latency: strike → JSON ≈ 2–7 minutes. Fine for situational
+# awareness; not a substitute for NLDN if sub-second latency matters.
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+# Required so GITHUB_TOKEN can push lightning.json back to the repo.
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # Prevent overlapping runs if a previous invocation is still going
+    # (NOAA's S3 list operations can be slow during convective surges).
+    concurrency:
+      group: update-lightning
+      cancel-in-progress: false
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        # netCDF4 wheels exist for cp311-linux-x86_64 → fast install,
+        # no apt packages needed.
+        run: pip install boto3 botocore netCDF4 numpy
+
+      - name: Fetch GLM
+        run: python fetch_glm.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name  'firestorm-bot'
+          git config user.email 'firestorm-bot@users.noreply.github.com'
+          git add data/lightning.json
+          if git diff --cached --quiet; then
+            echo 'No changes, skipping commit'
+          else
+            git commit -m "lightning update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push
+          fi
