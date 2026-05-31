@@ -1,36 +1,49 @@
 name: Update Lightning Data (GOES-R GLM)
 
-# Cron: every 5 minutes — GHA's documented minimum schedule interval
-# (anything tighter is silently downgraded; we've hit that in practice
-# on firestorm-aircraft-data).
+# CADENCE STRATEGY (v2 — 2026-05-31): self-re-dispatching loop + schedule safety net.
 #
-# 5-min cadence vs GLM's 20-second native rate is a deliberate tradeoff:
-# GHA cron is the only free always-on poll runner we have, and 5 min is
-# its floor. The 15-minute window in fetch_glm.py covers any GHA cron
-# slippage (1–5 min lag during high-load periods) and gives the frontend
-# a stable "last 15 minutes of strikes" view rather than a punctuated
-# 5-min slice.
+# GitHub Actions `schedule` is best-effort and HEAVILY throttled on free runners
+# under platform load — a nominal `*/5` cron was observed firing only ~once per
+# 1–2 HOURS in practice (verified 2026-05-31 against this repo's run history).
+# That is a documented GHA platform limitation, not a config bug: no cron
+# expression can force 5-min cadence on free schedule triggers.
 #
-# End-to-end latency: strike → JSON ≈ 2–7 minutes. Fine for situational
-# awareness; not a substitute for NLDN if sub-second latency matters.
+# Fix: each run does an INTERNAL fetch loop (fetch → sleep 60s → fetch …) for
+# ~5 minutes — so one run produces ~5 fresh updates instead of one — and then
+# RE-DISPATCHES itself via workflow_dispatch. workflow_dispatch (unlike schedule)
+# fires reliably, so this keeps a ~1-minute cadence going regardless of how badly
+# the schedule trigger is throttled.
+#
+# SAFETY NETS (so the chain can't die silently):
+#   • The `*/5` schedule is RETAINED as a dead-man restart — if a self-dispatch
+#     ever fails (API hiccup, abuse pause, error before the re-dispatch step),
+#     the next scheduled fire restarts the loop. Worst case degrades to the old
+#     throttled behavior, never to "stopped forever."
+#   • `concurrency` (cancel-in-progress:false) prevents pile-up if a scheduled
+#     run and a self-dispatched run overlap — the second queues, runs once.
+#   • The re-dispatch step is `if: always()` so a transient fetch error in the
+#     last loop iteration still re-arms the chain.
+#   • 8-min timeout > the ~5-min loop, leaving headroom for slow NOAA S3 lists.
+#
+# The 15-minute window in fetch_glm.py still smooths any per-fetch slippage.
+# End-to-end latency at ~1-min cadence: strike → JSON ≈ 1–3 minutes.
 on:
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '*/5 * * * *'          # dead-man restart only; real cadence is the self-loop
   workflow_dispatch:
 
-# Required so GITHUB_TOKEN can push lightning.json back to the repo.
+# contents: write → push lightning.json. actions: write → self re-dispatch.
 permissions:
   contents: write
+  actions: write
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    # Prevent overlapping runs if a previous invocation is still going
-    # (NOAA's S3 list operations can be slow during convective surges).
     concurrency:
       group: update-lightning
       cancel-in-progress: false
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -39,21 +52,40 @@ jobs:
           python-version: '3.11'
 
       - name: Install deps
-        # netCDF4 wheels exist for cp311-linux-x86_64 → fast install,
-        # no apt packages needed.
+        # netCDF4 wheels exist for cp311-linux-x86_64 → fast install.
         run: pip install boto3 botocore netCDF4 numpy
 
-      - name: Fetch GLM
-        run: python fetch_glm.py
-
-      - name: Commit if changed
+      - name: Fetch GLM in a ~5-min loop (≈1-min cadence)
+        # 5 iterations × ~60s = ~5 min wall-clock. Each iteration fetches +
+        # commits independently so every ~minute the published JSON is fresh,
+        # not just the final one. A single failed iteration is logged and the
+        # loop continues — the next iteration (or the schedule net) recovers.
         run: |
           git config user.name  'firestorm-bot'
           git config user.email 'firestorm-bot@users.noreply.github.com'
-          git add data/lightning.json
-          if git diff --cached --quiet; then
-            echo 'No changes, skipping commit'
-          else
-            git commit -m "lightning update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            git push
-          fi
+          for i in 1 2 3 4 5; do
+            echo "=== fetch iteration $i/5 ($(date -u +%H:%M:%S)Z) ==="
+            python fetch_glm.py || echo "iteration $i fetch failed (continuing)"
+            git add data/lightning.json
+            if git diff --cached --quiet; then
+              echo 'No changes this iteration, skipping commit'
+            else
+              git commit -m "lightning update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+              # Rebase-pull guards against a racing scheduled run having pushed.
+              git pull --rebase --autostash origin main || true
+              git push || echo "push failed iteration $i (will retry next iteration)"
+            fi
+            # Don't sleep after the last iteration — re-dispatch immediately.
+            if [ "$i" -lt 5 ]; then sleep 60; fi
+          done
+
+      - name: Re-dispatch self (keeps ~1-min cadence without relying on schedule)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # workflow_dispatch fires reliably (schedule does not). The concurrency
+          # group + cancel-in-progress:false means if the */5 schedule also fires,
+          # the extra run simply queues rather than stacking. Failure here is
+          # non-fatal: the schedule restarts the chain.
+          gh workflow run update-lightning.yml --ref main || echo "re-dispatch failed; schedule will restart the chain"
