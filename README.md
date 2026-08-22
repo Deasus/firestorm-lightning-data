@@ -1,6 +1,6 @@
 # firestorm-lightning-data
 
-Real-time lightning feed for [FIRESTORM](https://github.com/Deasus/Firestorm),
+Real-time lightning feed for [FIRESTORM](https://github.com/Deasus/firestorm-platform),
 mirroring GOES-R GLM Level-2 LCFA flashes from NOAA's Open Data S3 buckets
 to a slim JSON the FIRESTORM frontend reads via `raw.githubusercontent.com`.
 
